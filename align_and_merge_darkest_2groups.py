@@ -3,9 +3,12 @@
 Blind align sheets using ArUco markers, then split warped sheets into 2 groups by perceptual hash,
 and merge each group by darkest pixel. No master PDF, no ID matching.
 
+Now with optional final thresholding to harden text and suppress ghosting.
+
 Usage:
   python align_and_merge_darkest_2groups.py sheet_scans.pdf merged_2page.pdf \
-    --dpi 500 --aruco-dict 4X4_1000 --marker-cluster-eps 0.20 --min-markers-per-sheet 3 --debug-dir debug_out
+    --dpi 500 --aruco-dict 4X4_1000 --marker-cluster-eps 0.20 --min-markers-per-sheet 3 \
+    --final-threshold otsu --morph-open 3 --debug-dir debug_out
 """
 
 import argparse
@@ -53,6 +56,45 @@ class SheetQuad:
 
 # ---------- PDF I/O ----------
 
+import numpy as np
+import cv2
+
+def quad_from_all_marker_corners(corners: list[np.ndarray]) -> SheetQuad | None:
+    """
+    Fit a sheet quadrilateral from ALL detected marker corners using
+    convex hull + minimum area rectangle. Returns (tl,tr,br,bl) ordered for image coords.
+    """
+    if not corners:
+        return None
+    # Concatenate all 4x2 corner sets into Nx2 cloud
+    pts = np.vstack([c.reshape(-1, 2) for c in corners]).astype(np.float32)
+
+    # Convex hull to suppress outliers
+    hull = cv2.convexHull(pts)
+
+    # Min area rectangle over hull
+    rect = cv2.minAreaRect(hull)        # ((cx,cy),(w,h),angle)
+    box  = cv2.boxPoints(rect)          # 4x2 float32, unsorted
+    box  = box.astype(np.float32)
+
+    # Sort to tl,tr,br,bl in image coords (x right, y down)
+    s = box[:,0] + box[:,1]
+    d = box[:,0] - box[:,1]
+    tl = box[np.argmin(s)]
+    br = box[np.argmax(s)]
+    tr = box[np.argmin(d)]
+    bl = box[np.argmax(d)]
+    ordered = np.stack([tl,tr,br,bl], axis=0)
+
+    # Enforce clockwise order (negative area with y down)
+    x = ordered[:,0]; y = ordered[:,1]
+    area2 = (x[0]*y[1] - x[1]*y[0]) + (x[1]*y[2] - x[2]*y[1]) + \
+            (x[2]*y[3] - x[3]*y[2]) + (x[3]*y[0] - x[0]*y[3])
+    if area2 > 0:
+        ordered[[1,3]] = ordered[[3,1]]
+    return SheetQuad(tl=ordered[0], tr=ordered[1], br=ordered[2], bl=ordered[3])
+
+
 def pdf_pages_to_images(pdf_path: str, dpi: int) -> List[np.ndarray]:
     scale = dpi / 72.0
     images = []
@@ -66,7 +108,7 @@ def pdf_pages_to_images(pdf_path: str, dpi: int) -> List[np.ndarray]:
 
 def image_to_pdf_page(img_gray: np.ndarray, doc: fitz.Document, dpi: int):
     H, W = img_gray.shape
-    pil = Image.fromarray(img_gray)  # avoid deprecated mode="L"
+    pil = Image.fromarray(img_gray)
     buf = io.BytesIO(); pil.save(buf, format="PNG")
     width_pts = (W / dpi) * 72.0; height_pts = (H / dpi) * 72.0
     page = doc.new_page(width=width_pts, height=height_pts)
@@ -158,9 +200,8 @@ def order_quad(pts: np.ndarray) -> SheetQuad:
     Return corners as (tl, tr, br, bl) in image coords (x right, y down).
     Uses sum and (x - y) difference; then enforces clockwise orientation.
     """
-    # pts: (4,2) float array
     s = pts[:, 0] + pts[:, 1]        # x + y
-    d = pts[:, 0] - pts[:, 1]        # x - y  ← this is the important correction
+    d = pts[:, 0] - pts[:, 1]        # x - y
 
     tl = pts[np.argmin(s)]
     br = pts[np.argmax(s)]
@@ -174,11 +215,9 @@ def order_quad(pts: np.ndarray) -> SheetQuad:
     area2 = (x[0]*y[1] - x[1]*y[0]) + (x[1]*y[2] - x[2]*y[1]) + \
             (x[2]*y[3] - x[3]*y[2]) + (x[3]*y[0] - x[0]*y[3])
     if area2 > 0:
-        # If counterclockwise, swap tr and bl to flip to clockwise
         ordered[[1, 3]] = ordered[[3, 1]]
 
     return SheetQuad(tl=ordered[0], tr=ordered[1], br=ordered[2], bl=ordered[3])
-
 
 # ---------- Warping and merging ----------
 
@@ -191,10 +230,11 @@ def estimate_sheet_size(quad: SheetQuad) -> Tuple[int, int]:
 def homography_warp(img: np.ndarray, quad: SheetQuad, out_wh: Tuple[int, int]) -> np.ndarray:
     W, H = out_wh
     src = np.float32([quad.tl, quad.tr, quad.br, quad.bl])
-    # Swap the vertical coordinates to fix vertical flip
+    # Map so that top-left is (0,0), y increases downward; fix vertical flip
     dst = np.float32([[0, H-1], [W-1, H-1], [W-1, 0], [0, 0]])
     Hmat = cv2.getPerspectiveTransform(src, dst)
-    return cv2.warpPerspective(img, Hmat, (W, H), flags=cv2.INTER_AREA, borderMode=cv2.BORDER_CONSTANT, borderValue=(255,255,255))
+    return cv2.warpPerspective(img, Hmat, (W, H), flags=cv2.INTER_AREA,
+                               borderMode=cv2.BORDER_CONSTANT, borderValue=(255,255,255))
 
 def merge_darkest_gray(images_bgr: List[np.ndarray]) -> np.ndarray:
     if not images_bgr:
@@ -206,6 +246,52 @@ def merge_darkest_gray(images_bgr: List[np.ndarray]) -> np.ndarray:
     for g in grays[1:]:
         np.minimum(merged, g, out=merged)
     return merged
+
+# ---------- Final thresholding & morphology (NEW) ----------
+
+def apply_final_threshold(img_gray: np.ndarray,
+                          method: str,
+                          percentile: float = 75.0,
+                          adaptive_block: int = 35,
+                          adaptive_C: int = 5) -> np.ndarray:
+    """
+    Returns a uint8 0/255 image. method in {"none","otsu","percentile","adaptive"}.
+    """
+    if method == "none":
+        return img_gray
+
+    if method == "otsu":
+        _t, bw = cv2.threshold(img_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return bw
+
+    if method == "percentile":
+        # clamp percentile and compute robust global threshold
+        p = float(np.clip(percentile, 0.0, 100.0))
+        thr = np.percentile(img_gray, p)
+        _t, bw = cv2.threshold(img_gray, int(thr), 255, cv2.THRESH_BINARY)
+        return bw
+
+    if method == "adaptive":
+        blk = adaptive_block if adaptive_block % 2 == 1 else adaptive_block + 1
+        bw = cv2.adaptiveThreshold(img_gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                   cv2.THRESH_BINARY, blk, adaptive_C)
+        return bw
+
+    # Fallback: no change if unknown method
+    return img_gray
+
+def apply_morphology(img_gray: np.ndarray, open_k: int = 0, close_k: int = 0) -> np.ndarray:
+    """
+    Applies opening/closing on a binary image. Kernel sizes 0 mean 'skip'.
+    """
+    out = img_gray
+    if open_k and open_k > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (open_k, open_k))
+        out = cv2.morphologyEx(out, cv2.MORPH_OPEN, k)
+    if close_k and close_k > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (close_k, close_k))
+        out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, k)
+    return out
 
 # ---------- Perceptual hash + K-means (K=2) ----------
 
@@ -231,7 +317,6 @@ def kmeans_binary_hashes(hashes: List[np.ndarray], k: int = 2, iters: int = 25, 
             pred = (C[j] >= 0.5).astype(np.uint8)
             dists[:, j] = np.count_nonzero(H != pred, axis=1)
         labels = np.argmin(dists, axis=1)
-        # update
         newC = np.zeros_like(C)
         for j in range(C.shape[0]):
             members = H[labels == j]
@@ -251,20 +336,23 @@ def extract_sheet_quads(img: np.ndarray, det: aruco.ArucoDetector,
     corners, ids = detect_aruco_any(det, img)
     if ids.size == 0:
         return []
+    # cluster by marker centres (okay for grouping)
     ctrs = centers_from_corners(corners)
     h, w, _ = img.shape
     eps = cluster_eps_frac * min(w, h)
     clusters = cluster_points(ctrs, eps)
+
     quads: List[SheetQuad] = []
     for cl in clusters:
         if len(cl) < min_markers_per_sheet:
             continue
-        pts = ctrs[cl]
-        if len(pts) < 4:
-            continue
-        chosen = farthest_four(pts)
-        quads.append(order_quad(chosen))
+        # pull the actual corner arrays for members of this cluster
+        cluster_corners = [corners[i] for i in cl]
+        q = quad_from_all_marker_corners(cluster_corners)
+        if q is not None:
+            quads.append(q)
     return quads
+
 
 def main():
     ap = argparse.ArgumentParser(description="Blind ArUco alignment into 2 groups, darkest-merge to a 2-page PDF.")
@@ -279,6 +367,23 @@ def main():
     ap.add_argument("--override-size-mm", type=float, nargs=2, metavar=("W_MM", "H_MM"),
                     help="Force output sheet size (e.g., 215.9 279.4 for Letter).")
     ap.add_argument("--debug-dir", default=None, help="Optional folder for debug warped sheets.")
+
+    # New thresholding options
+    ap.add_argument("--final-threshold", default="none",
+                    choices=["none", "otsu", "percentile", "adaptive"],
+                    help="Final binarisation method applied after merging.")
+    ap.add_argument("--percentile", type=float, default=75.0,
+                    help="Percentile for 'percentile' thresholding (0..100).")
+    ap.add_argument("--adaptive-block", type=int, default=35,
+                    help="Odd window size for 'adaptive' thresholding.")
+    ap.add_argument("--adaptive-C", type=int, default=5,
+                    help="Constant subtracted in 'adaptive' thresholding.")
+
+    ap.add_argument("--morph-open", type=int, default=0,
+                    help="Apply morphological opening with NxN kernel (N>0).")
+    ap.add_argument("--morph-close", type=int, default=0,
+                    help="Apply morphological closing with NxN kernel (N>0).")
+
     args = ap.parse_args()
 
     det = build_detector(args.aruco_dict)
@@ -330,8 +435,24 @@ def main():
     doc = fitz.open()
     for gi, (lab, imgs) in enumerate(ordered, start=1):
         merged_gray = merge_darkest_gray(imgs)
-        image_to_pdf_page(merged_gray, doc, dpi=args.dpi)
-        print(f"[OK] Cluster {gi} (label {lab}): merged {len(imgs)} sheet(s).")
+
+        # Apply final thresholding and optional morphology (NEW)
+        bw = apply_final_threshold(
+            merged_gray,
+            method=args.final_threshold,
+            percentile=args.percentile,
+            adaptive_block=args.adaptive_block,
+            adaptive_C=args.adaptive_C,
+        )
+        if args.final_threshold != "none":
+            bw = apply_morphology(bw, open_k=args.morph_open, close_k=args.morph_close)
+            image_to_pdf_page(bw, doc, dpi=args.dpi)
+        else:
+            image_to_pdf_page(merged_gray, doc, dpi=args.dpi)
+
+        print(f"[OK] Cluster {gi} (label {lab}): merged {len(imgs)} sheet(s). "
+              f"threshold={args.final_threshold}")
+
     doc.save(args.output_pdf); doc.close()
     print(f"[DONE] Wrote {len(ordered)} page(s) to {args.output_pdf}")
 

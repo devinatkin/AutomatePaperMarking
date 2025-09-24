@@ -1,0 +1,1 @@
+python align_and_merge_darkest_2groups.py .\scan_dmatkin_2025-09-24-10-59-48.pdf merged_session_sheet.pdf --dpi 1000 --aruco-dict 4X4_1000 --marker-cluster-eps 1.5 --debug-dir debug_out --final-threshold adaptive --adaptive-block 41 --adaptive-C 7 --morph-close 4 --morph-open 2
