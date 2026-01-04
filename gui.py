@@ -164,10 +164,12 @@ def _render_pdf_preview(pdf_path: str, max_dim: int = 400) -> QtGui.QPixmap | No
         zoom = zoom if zoom > 0 else 1.0
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat, alpha=False)
-        qimage = QtGui.QImage(
-            pix.samples, pix.width, pix.height, pix.stride, QtGui.QImage.Format_RGB888
-        ).copy()
-        return QtGui.QPixmap.fromImage(qimage)
+
+        # Use PNG bytes to let Qt handle the colorspace/stride differences robustly.
+        qpixmap = QtGui.QPixmap()
+        if qpixmap.loadFromData(pix.tobytes("png")):
+            return qpixmap
+        return None
     except Exception:
         return None
     finally:
