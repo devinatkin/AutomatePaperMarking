@@ -20,3 +20,9 @@ python gui.py
 ```
 
 Provides tabs for both stamping ArUco corners and aligning/merging marked PDFs. Requires PyQt5 in addition to the existing dependencies.
+
+## Setup
+Install dependencies with:
+```
+pip install -r requirements.txt
+```

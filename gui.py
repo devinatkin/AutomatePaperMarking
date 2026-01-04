@@ -19,7 +19,7 @@ import sys
 import tempfile
 from typing import Callable, Iterable
 
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtCore, QtGui, QtWidgets
 
 from align_and_merge import (
     align_page_images,
@@ -148,14 +148,51 @@ def align_task(input_pdf: str, output_pdf: str, dpi: int = 300) -> TaskWorker:
     return TaskWorker(_run)
 
 
+def _suggest_output_path(input_path: str, suffix: str) -> str:
+    base, _ = os.path.splitext(input_path)
+    return f"{base}{suffix}"
+
+
+def _render_pdf_preview(pdf_path: str, max_dim: int = 400) -> QtGui.QPixmap | None:
+    doc: fitz.Document | None = None
+    try:
+        doc = fitz.open(pdf_path)
+        if not doc:
+            return None
+        page = doc.load_page(0)
+        zoom = min(max_dim / page.rect.width, max_dim / page.rect.height)
+        zoom = zoom if zoom > 0 else 1.0
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        qimage = QtGui.QImage(
+            pix.samples, pix.width, pix.height, pix.stride, QtGui.QImage.Format_RGB888
+        ).copy()
+        return QtGui.QPixmap.fromImage(qimage)
+    except Exception:
+        return None
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+
+
 class MainWindow(QtWidgets.QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Automate Paper Marking GUI")
         self.resize(700, 550)
         self._worker: TaskWorker | None = None
+        self._last_suggested: dict[QtWidgets.QLineEdit, str] = {}
 
         layout = QtWidgets.QVBoxLayout(self)
+        menubar = QtWidgets.QMenuBar()
+        options_menu = menubar.addMenu("Options")
+        self.toggle_advanced_action = options_menu.addAction("Show Advanced Options")
+        self.toggle_advanced_action.setCheckable(True)
+        self.toggle_advanced_action.toggled.connect(self._toggle_advanced)
+        layout.setMenuBar(menubar)
+
         self.tabs = QtWidgets.QTabWidget()
         layout.addWidget(self.tabs)
 
@@ -163,6 +200,8 @@ class MainWindow(QtWidgets.QWidget):
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(1000)
         layout.addWidget(self.log)
+
+        self.advanced_groups: list[QtWidgets.QWidget] = []
 
         self.tabs.addTab(self._build_stamp_tab(), "Stamp ArUco Corners")
         self.tabs.addTab(self._build_align_tab(), "Align and Merge")
@@ -173,9 +212,20 @@ class MainWindow(QtWidgets.QWidget):
         form = QtWidgets.QFormLayout(widget)
 
         self.stamp_input = QtWidgets.QLineEdit()
+        self.stamp_input.textChanged.connect(
+            lambda text: self._handle_input_change(
+                text, self.stamp_output, "_stamped.pdf", self.stamp_preview
+            )
+        )
         self.stamp_output = QtWidgets.QLineEdit()
         self._add_file_row(form, "Input PDF", self.stamp_input, select_output=False)
         self._add_file_row(form, "Output PDF", self.stamp_output, select_output=True)
+
+        self.stamp_preview = QtWidgets.QLabel("Select an input PDF to preview the first page.")
+        self.stamp_preview.setAlignment(QtCore.Qt.AlignCenter)
+        self.stamp_preview.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        self.stamp_preview.setMinimumHeight(180)
+        form.addRow("Preview", self.stamp_preview)
 
         self.marker_mm = QtWidgets.QDoubleSpinBox()
         self.marker_mm.setRange(1.0, 100.0)
@@ -187,35 +237,42 @@ class MainWindow(QtWidgets.QWidget):
         self.inset_mm.setValue(6.0)
         form.addRow("Inset from edge (mm)", self.inset_mm)
 
+        advanced_widget = QtWidgets.QGroupBox("Advanced Options")
+        adv_form = QtWidgets.QFormLayout(advanced_widget)
+
         self.dictionary = QtWidgets.QComboBox()
         self.dictionary.addItems(sorted(ARUCO_DICT_NAMES.keys()))
         self.dictionary.setCurrentText("4X4_1000")
-        form.addRow("Dictionary", self.dictionary)
+        adv_form.addRow("Dictionary", self.dictionary)
 
         self.unique_ids = QtWidgets.QCheckBox("Use unique IDs per page")
         self.unique_ids.setChecked(True)
-        form.addRow("Unique IDs", self.unique_ids)
+        adv_form.addRow("Unique IDs", self.unique_ids)
 
         self.password = QtWidgets.QLineEdit()
         self.password.setEchoMode(QtWidgets.QLineEdit.Password)
-        form.addRow("PDF password", self.password)
+        adv_form.addRow("PDF password", self.password)
 
         self.render_px = QtWidgets.QSpinBox()
         self.render_px.setRange(64, 2000)
         self.render_px.setValue(300)
-        form.addRow("Render size (px)", self.render_px)
+        adv_form.addRow("Render size (px)", self.render_px)
 
         self.border_bits = QtWidgets.QSpinBox()
         self.border_bits.setRange(0, 10)
         self.border_bits.setValue(1)
-        form.addRow("Border bits", self.border_bits)
+        adv_form.addRow("Border bits", self.border_bits)
 
         self.opacity = QtWidgets.QDoubleSpinBox()
         self.opacity.setDecimals(2)
         self.opacity.setRange(0.05, 1.0)
         self.opacity.setSingleStep(0.05)
         self.opacity.setValue(1.0)
-        form.addRow("Opacity", self.opacity)
+        adv_form.addRow("Opacity", self.opacity)
+
+        advanced_widget.setVisible(False)
+        self.advanced_groups.append(advanced_widget)
+        form.addRow(advanced_widget)
 
         self.stamp_button = QtWidgets.QPushButton("Run Stamping")
         self.stamp_button.clicked.connect(self._start_stamp)
@@ -228,14 +285,32 @@ class MainWindow(QtWidgets.QWidget):
         form = QtWidgets.QFormLayout(widget)
 
         self.align_input = QtWidgets.QLineEdit()
+        self.align_input.textChanged.connect(
+            lambda text: self._handle_input_change(
+                text, self.align_output, "_merged.pdf", self.align_preview
+            )
+        )
         self.align_output = QtWidgets.QLineEdit()
         self._add_file_row(form, "Input PDF", self.align_input, select_output=False)
         self._add_file_row(form, "Output PDF", self.align_output, select_output=True)
 
+        self.align_preview = QtWidgets.QLabel("Select an input PDF to preview the first page.")
+        self.align_preview.setAlignment(QtCore.Qt.AlignCenter)
+        self.align_preview.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        self.align_preview.setMinimumHeight(180)
+        form.addRow("Preview", self.align_preview)
+
+        advanced_widget = QtWidgets.QGroupBox("Advanced Options")
+        adv_form = QtWidgets.QFormLayout(advanced_widget)
+
         self.dpi_spin = QtWidgets.QSpinBox()
         self.dpi_spin.setRange(72, 600)
         self.dpi_spin.setValue(300)
-        form.addRow("Render DPI", self.dpi_spin)
+        adv_form.addRow("Render DPI", self.dpi_spin)
+
+        advanced_widget.setVisible(False)
+        self.advanced_groups.append(advanced_widget)
+        form.addRow(advanced_widget)
 
         self.align_button = QtWidgets.QPushButton("Align and Merge")
         self.align_button.clicked.connect(self._start_align)
@@ -323,6 +398,44 @@ class MainWindow(QtWidgets.QWidget):
             path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select input PDF", filter="PDF Files (*.pdf)")
         if path:
             line_edit.setText(path)
+
+    def _handle_input_change(
+        self,
+        input_path: str,
+        output_edit: QtWidgets.QLineEdit,
+        suffix: str,
+        preview_label: QtWidgets.QLabel,
+    ) -> None:
+        if input_path:
+            suggested = _suggest_output_path(input_path, suffix)
+            current_output = output_edit.text().strip()
+            if not current_output or current_output == self._last_suggested.get(output_edit, ""):
+                output_edit.setText(suggested)
+                self._last_suggested[output_edit] = suggested
+            self._update_preview(preview_label, input_path)
+        else:
+            preview_label.setText("Select an input PDF to preview the first page.")
+            preview_label.setPixmap(QtGui.QPixmap())
+
+    def _update_preview(self, preview_label: QtWidgets.QLabel, pdf_path: str) -> None:
+        pixmap = _render_pdf_preview(pdf_path)
+        if pixmap:
+            preview_label.setPixmap(
+                pixmap.scaled(
+                    preview_label.size() if preview_label.size().isValid() else QtCore.QSize(320, 240),
+                    QtCore.Qt.KeepAspectRatio,
+                    QtCore.Qt.SmoothTransformation,
+                )
+            )
+            preview_label.setText("")
+        else:
+            preview_label.setText("Unable to load preview for this file.")
+            preview_label.setPixmap(QtGui.QPixmap())
+
+    def _toggle_advanced(self, show: bool) -> None:
+        for widget in self.advanced_groups:
+            widget.setVisible(show)
+        self.toggle_advanced_action.setText("Hide Advanced Options" if show else "Show Advanced Options")
 
     def _log(self, message: str) -> None:
         self.log.appendPlainText(message)
