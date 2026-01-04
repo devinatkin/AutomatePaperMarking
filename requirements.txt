@@ -1,0 +1,6 @@
+PyQt5
+PyMuPDF
+opencv-python-headless
+Pillow
+numpy
+PyPDF2
