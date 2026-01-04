@@ -13,3 +13,10 @@ python .\align_and_merge.py .\SessionScans.pdf .\Merged.pdf
 ```
 
 This script takes a scan of all the pages from all the TAs and automatically identifies the Markers on the corners using them to align the sheets together and reassemble a PDF with the different sheets merged together. This one marking sheet is then substantially faster to enter than going through the sheets independently.
+
+## GUI (Qt)
+```
+python gui.py
+```
+
+Provides tabs for both stamping ArUco corners and aligning/merging marked PDFs. Requires PyQt5 in addition to the existing dependencies.
