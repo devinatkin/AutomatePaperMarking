@@ -19,7 +19,7 @@ import sys
 import tempfile
 from typing import Callable, Iterable
 
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5 import QtCore, QtWidgets
 
 from align_and_merge import (
     align_page_images,
@@ -153,32 +153,6 @@ def _suggest_output_path(input_path: str, suffix: str) -> str:
     return f"{base}{suffix}"
 
 
-def _render_pdf_preview(pdf_path: str, max_dim: int = 400) -> QtGui.QPixmap | None:
-    doc: fitz.Document | None = None
-    try:
-        doc = fitz.open(pdf_path)
-        if not doc:
-            return None
-        page = doc.load_page(0)
-        zoom = min(max_dim / page.rect.width, max_dim / page.rect.height)
-        zoom = zoom if zoom > 0 else 1.0
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-
-        # Use PNG bytes to let Qt handle the colorspace/stride differences robustly.
-        qpixmap = QtGui.QPixmap()
-        if qpixmap.loadFromData(pix.tobytes("png")):
-            return qpixmap
-        return None
-    except Exception:
-        return None
-    finally:
-        try:
-            doc.close()
-        except Exception:
-            pass
-
-
 class MainWindow(QtWidgets.QWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -216,18 +190,12 @@ class MainWindow(QtWidgets.QWidget):
         self.stamp_input = QtWidgets.QLineEdit()
         self.stamp_input.textChanged.connect(
             lambda text: self._handle_input_change(
-                text, self.stamp_output, "_stamped.pdf", self.stamp_preview
+                text, self.stamp_output, "_stamped.pdf"
             )
         )
         self.stamp_output = QtWidgets.QLineEdit()
         self._add_file_row(form, "Input PDF", self.stamp_input, select_output=False)
         self._add_file_row(form, "Output PDF", self.stamp_output, select_output=True)
-
-        self.stamp_preview = QtWidgets.QLabel("Select an input PDF to preview the first page.")
-        self.stamp_preview.setAlignment(QtCore.Qt.AlignCenter)
-        self.stamp_preview.setFrameShape(QtWidgets.QFrame.StyledPanel)
-        self.stamp_preview.setMinimumHeight(180)
-        form.addRow("Preview", self.stamp_preview)
 
         self.marker_mm = QtWidgets.QDoubleSpinBox()
         self.marker_mm.setRange(1.0, 100.0)
@@ -289,18 +257,12 @@ class MainWindow(QtWidgets.QWidget):
         self.align_input = QtWidgets.QLineEdit()
         self.align_input.textChanged.connect(
             lambda text: self._handle_input_change(
-                text, self.align_output, "_merged.pdf", self.align_preview
+                text, self.align_output, "_merged.pdf"
             )
         )
         self.align_output = QtWidgets.QLineEdit()
         self._add_file_row(form, "Input PDF", self.align_input, select_output=False)
         self._add_file_row(form, "Output PDF", self.align_output, select_output=True)
-
-        self.align_preview = QtWidgets.QLabel("Select an input PDF to preview the first page.")
-        self.align_preview.setAlignment(QtCore.Qt.AlignCenter)
-        self.align_preview.setFrameShape(QtWidgets.QFrame.StyledPanel)
-        self.align_preview.setMinimumHeight(180)
-        form.addRow("Preview", self.align_preview)
 
         advanced_widget = QtWidgets.QGroupBox("Advanced Options")
         adv_form = QtWidgets.QFormLayout(advanced_widget)
@@ -406,7 +368,6 @@ class MainWindow(QtWidgets.QWidget):
         input_path: str,
         output_edit: QtWidgets.QLineEdit,
         suffix: str,
-        preview_label: QtWidgets.QLabel,
     ) -> None:
         if input_path:
             suggested = _suggest_output_path(input_path, suffix)
@@ -414,25 +375,6 @@ class MainWindow(QtWidgets.QWidget):
             if not current_output or current_output == self._last_suggested.get(output_edit, ""):
                 output_edit.setText(suggested)
                 self._last_suggested[output_edit] = suggested
-            self._update_preview(preview_label, input_path)
-        else:
-            preview_label.setText("Select an input PDF to preview the first page.")
-            preview_label.setPixmap(QtGui.QPixmap())
-
-    def _update_preview(self, preview_label: QtWidgets.QLabel, pdf_path: str) -> None:
-        pixmap = _render_pdf_preview(pdf_path)
-        if pixmap:
-            preview_label.setPixmap(
-                pixmap.scaled(
-                    preview_label.size() if preview_label.size().isValid() else QtCore.QSize(320, 240),
-                    QtCore.Qt.KeepAspectRatio,
-                    QtCore.Qt.SmoothTransformation,
-                )
-            )
-            preview_label.setText("")
-        else:
-            preview_label.setText("Unable to load preview for this file.")
-            preview_label.setPixmap(QtGui.QPixmap())
 
     def _toggle_advanced(self, show: bool) -> None:
         for widget in self.advanced_groups:
